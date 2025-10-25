@@ -1,0 +1,627 @@
+#!/system/bin/sh
+
+###############################################################################
+# GamerX Performance Manager - Universal Performance Engine v2.1 Enhanced
+# Advanced Cross-Platform Performance Controller
+# Supports: Snapdragon, MediaTek, Exynos, Universal Devices
+# Root Methods: Magisk, KernelSU, APatch
+# Author: GamerXECO
+###############################################################################
+
+# Module directories
+MODDIR="/data/adb/modules/gamerx_performance_manager"
+CONFIG_DIR="$MODDIR/config"
+LOG_FILE="$MODDIR/gamerx_perf.log"
+STATE_FILE="$CONFIG_DIR/current_profile"
+
+# Thermal safety thresholds (millicelsius)
+THERMAL_WARNING=70000
+THERMAL_THROTTLE=80000
+THERMAL_EMERGENCY=90000
+
+###############################################################################
+# UTILITY FUNCTIONS
+###############################################################################
+
+log_msg() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+write_safe() {
+    local path="$1"
+    local value="$2"
+    
+    if [ -w "$path" ]; then
+        echo "$value" > "$path" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+###############################################################################
+# HARDWARE DETECTION
+###############################################################################
+
+detect_soc_type() {
+    local soc=$(getprop ro.hardware.chipset 2>/dev/null)
+    [ -z "$soc" ] && soc=$(getprop ro.board.platform 2>/dev/null)
+    [ -z "$soc" ] && soc=$(getprop ro.hardware 2>/dev/null)
+    [ -z "$soc" ] && soc=$(getprop ro.product.board 2>/dev/null)
+    
+    case "$soc" in
+        *msm*|*qcom*|*sdm*|*sm*|*lahaina*|*taro*) echo "snapdragon" ;;
+        *mt*|*mediatek*) echo "mediatek" ;;
+        *exynos*) echo "exynos" ;;
+        *) echo "generic" ;;
+    esac
+}
+
+detect_root_method() {
+    if [ -d "/data/adb/magisk" ] || [ -f "/data/adb/magisk/busybox" ]; then
+        echo "magisk"
+    elif [ -d "/data/adb/ksu" ] || [ -f "/data/adb/ksud" ]; then
+        echo "kernelsu"
+    elif [ -d "/data/adb/ap" ] || [ -f "/data/adb/apd" ]; then
+        echo "apatch"
+    else
+        echo "unknown"
+    fi
+}
+
+get_cpu_count() {
+    grep -c "processor" /proc/cpuinfo
+}
+
+get_available_governors() {
+    local cpu_path="/sys/devices/system/cpu/cpu0/cpufreq"
+    if [ -r "$cpu_path/scaling_available_governors" ]; then
+        cat "$cpu_path/scaling_available_governors" 2>/dev/null
+    else
+        echo "schedutil performance powersave"
+    fi
+}
+
+get_thermal_temp() {
+    local max_temp=0
+    for temp_file in /sys/class/thermal/thermal_zone*/temp; do
+        if [ -r "$temp_file" ]; then
+            local temp=$(cat "$temp_file" 2>/dev/null || echo "0")
+            [ "$temp" -gt "$max_temp" ] && max_temp=$temp
+        fi
+    done
+    echo "$max_temp"
+}
+
+get_total_ram() {
+    # Get total RAM in MB
+    local ram_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    [ -z "$ram_kb" ] && ram_kb=4194304  # Default 4GB if read fails
+    echo $((ram_kb / 1024))
+}
+
+detect_kernel_features() {
+    # Detect available kernel features
+    local features=""
+    
+    [ -d "/dev/stune" ] && features="$features schedtune"
+    [ -d "/dev/cpuset" ] && features="$features cpuset"
+    [ -f "/sys/module/cpu_boost/parameters/input_boost_freq" ] && features="$features cpu_boost"
+    [ -d "/sys/kernel/debug/sched_features" ] && features="$features sched_features"
+    
+    echo "$features"
+}
+
+###############################################################################
+# CPU FREQUENCY MANAGEMENT
+###############################################################################
+
+set_cpu_governor() {
+    local governor="$1"
+    local cpu_count=$(get_cpu_count)
+    local available=$(get_available_governors)
+    
+    # Check if governor is available
+    if echo "$available" | grep -q "$governor"; then
+        log_msg "Setting CPU governor to: $governor"
+        
+        for cpu in $(seq 0 $((cpu_count-1))); do
+            local gov_path="/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor"
+            write_safe "$gov_path" "$governor"
+        done
+    else
+        log_msg "Governor $governor not available. Available: $available"
+        # Fallback to best available governor
+        if echo "$available" | grep -q "performance"; then
+            governor="performance"
+        elif echo "$available" | grep -q "schedutil"; then
+            governor="schedutil"
+        else
+            governor=$(echo "$available" | awk '{print $1}')
+        fi
+        log_msg "Using fallback governor: $governor"
+        
+        for cpu in $(seq 0 $((cpu_count-1))); do
+            local gov_path="/sys/devices/system/cpu/cpu${cpu}/cpufreq/scaling_governor"
+            write_safe "$gov_path" "$governor"
+        done
+    fi
+}
+
+set_cpu_freq_range() {
+    local min_freq="$1"
+    local max_freq="$2"
+    local cpu_count=$(get_cpu_count)
+    
+    log_msg "Setting CPU frequency range: ${min_freq}% - ${max_freq}% of max"
+    
+    for cpu in $(seq 0 $((cpu_count-1))); do
+        local cpu_path="/sys/devices/system/cpu/cpu${cpu}/cpufreq"
+        
+        if [ -d "$cpu_path" ]; then
+            # Get available frequencies
+            local cpu_min=$(cat "$cpu_path/cpuinfo_min_freq" 2>/dev/null || echo "300000")
+            local cpu_max=$(cat "$cpu_path/cpuinfo_max_freq" 2>/dev/null || echo "2000000")
+            
+            # Set scaling frequencies (use percentage of max if specified as percentage)
+            if [ "$max_freq" = "100" ]; then
+                write_safe "$cpu_path/scaling_max_freq" "$cpu_max"
+            elif [ "$max_freq" -lt "1000" ]; then
+                # Treat as percentage
+                local target_max=$((cpu_max * max_freq / 100))
+                write_safe "$cpu_path/scaling_max_freq" "$target_max"
+            else
+                write_safe "$cpu_path/scaling_max_freq" "$max_freq"
+            fi
+            
+            if [ "$min_freq" -lt "1000" ]; then
+                # Treat as percentage
+                local target_min=$((cpu_min * min_freq / 100))
+                write_safe "$cpu_path/scaling_min_freq" "$target_min"
+            else
+                write_safe "$cpu_path/scaling_min_freq" "$min_freq"
+            fi
+        fi
+    done
+}
+
+manage_cpu_boost() {
+    local mode="$1"  # off, light, medium, full
+    
+    log_msg "Managing CPU boost: $mode"
+    
+    case "$mode" in
+        off)
+            write_safe /sys/module/cpu_boost/parameters/input_boost_enabled 0
+            write_safe /sys/module/cpu_boost/parameters/input_boost_ms 0
+            ;;
+        light)
+            write_safe /sys/module/cpu_boost/parameters/input_boost_enabled 1
+            write_safe /sys/module/cpu_boost/parameters/input_boost_ms 40
+            write_safe /sys/module/cpu_boost/parameters/input_boost_freq 1200000
+            ;;
+        medium)
+            write_safe /sys/module/cpu_boost/parameters/input_boost_enabled 1
+            write_safe /sys/module/cpu_boost/parameters/input_boost_ms 60
+            write_safe /sys/module/cpu_boost/parameters/input_boost_freq 1400000
+            ;;
+        full)
+            write_safe /sys/module/cpu_boost/parameters/input_boost_enabled 1
+            write_safe /sys/module/cpu_boost/parameters/input_boost_ms 100
+            write_safe /sys/module/cpu_boost/parameters/input_boost_freq 1900000
+            ;;
+    esac
+}
+
+###############################################################################
+# GPU MANAGEMENT
+###############################################################################
+
+set_gpu_performance() {
+    local mode="$1"  # performance, balanced, powersave
+    local soc=$(detect_soc_type)
+    
+    log_msg "Setting GPU performance mode: $mode (SoC: $soc)"
+    
+    # Qualcomm Adreno GPU paths
+    local qcom_gpu_paths="
+        /sys/class/kgsl/kgsl-3d0/devfreq/governor
+        /sys/devices/platform/kgsl-3d0.0/kgsl/kgsl-3d0/devfreq/governor
+        /sys/class/devfreq/kgsl-3d0/governor
+    "
+    
+    # MediaTek Mali GPU paths
+    local mtk_gpu_paths="
+        /proc/gpufreq/gpufreq_opp_freq
+        /proc/mali/dvfs_governor
+        /sys/devices/platform/*/mali*/dvfs_governor
+    "
+    
+    # Exynos Mali GPU paths
+    local exynos_gpu_paths="
+        /sys/devices/platform/*/mali/dvfs_governor
+        /sys/class/misc/mali0/device/dvfs_governor
+    "
+    
+    case "$soc" in
+        snapdragon)
+            for path in $qcom_gpu_paths; do
+                if [ -w "$path" ]; then
+                    case "$mode" in
+                        performance) write_safe "$path" "performance" || write_safe "$path" "msm-adreno-tz" ;;
+                        powersave) write_safe "$path" "powersave" ;;
+                        *) write_safe "$path" "msm-adreno-tz" ;;
+                    esac
+                fi
+            done
+            ;;
+        mediatek)
+            for path in $mtk_gpu_paths; do
+                if [ -w "$path" ]; then
+                    case "$mode" in
+                        performance) write_safe "$path" "performance" ;;
+                        powersave) write_safe "$path" "powersave" ;;
+                        *) write_safe "$path" "simple_ondemand" ;;
+                    esac
+                fi
+            done
+            ;;
+        exynos)
+            for path in $exynos_gpu_paths; do
+                if [ -w "$path" ]; then
+                    case "$mode" in
+                        performance) write_safe "$path" "performance" ;;
+                        powersave) write_safe "$path" "powersave" ;;
+                        *) write_safe "$path" "interactive" ;;
+                    esac
+                fi
+            done
+            ;;
+        *)
+            # Generic GPU control
+            for gpu_gov in /sys/class/devfreq/*/governor; do
+                if [ -w "$gpu_gov" ]; then
+                    case "$mode" in
+                        performance) write_safe "$gpu_gov" "performance" ;;
+                        powersave) write_safe "$gpu_gov" "powersave" ;;
+                        *) write_safe "$gpu_gov" "simple_ondemand" ;;
+                    esac
+                fi
+            done
+            ;;
+    esac
+}
+
+###############################################################################
+# MEMORY & I/O MANAGEMENT
+###############################################################################
+
+optimize_memory() {
+    local mode="$1"  # aggressive, balanced, conservative
+    local ram=$(get_total_ram)
+    
+    log_msg "Optimizing memory management: $mode (RAM: ${ram}MB)"
+    
+    # RAM-based adaptive tuning
+    case "$mode" in
+        aggressive)
+            if [ "$ram" -lt 4096 ]; then
+                write_safe /proc/sys/vm/swappiness 30
+            else
+                write_safe /proc/sys/vm/swappiness 10
+            fi
+            write_safe /proc/sys/vm/vfs_cache_pressure 50
+            write_safe /proc/sys/vm/dirty_ratio 30
+            write_safe /proc/sys/vm/dirty_background_ratio 10
+            write_safe /proc/sys/vm/page-cluster 0
+            ;;
+        conservative)
+            write_safe /proc/sys/vm/swappiness 100
+            write_safe /proc/sys/vm/vfs_cache_pressure 100
+            write_safe /proc/sys/vm/dirty_ratio 20
+            write_safe /proc/sys/vm/dirty_background_ratio 5
+            write_safe /proc/sys/vm/page-cluster 3
+            ;;
+        *)
+            if [ "$ram" -lt 3072 ]; then
+                write_safe /proc/sys/vm/swappiness 80
+            else
+                write_safe /proc/sys/vm/swappiness 60
+            fi
+            write_safe /proc/sys/vm/vfs_cache_pressure 80
+            write_safe /proc/sys/vm/dirty_ratio 25
+            write_safe /proc/sys/vm/dirty_background_ratio 8
+            write_safe /proc/sys/vm/page-cluster 2
+            ;;
+    esac
+    
+    # Low Memory Killer (minfree) - RAM based
+    if [ -w /sys/module/lowmemorykiller/parameters/minfree ]; then
+        case "$mode" in
+            aggressive)
+                if [ "$ram" -gt 6144 ]; then
+                    write_safe /sys/module/lowmemorykiller/parameters/minfree "18432,23040,27648,32256,55296,80640"
+                else
+                    write_safe /sys/module/lowmemorykiller/parameters/minfree "18432,23040,27648,32256,46080,65536"
+                fi
+                ;;
+            conservative)
+                write_safe /sys/module/lowmemorykiller/parameters/minfree "18432,23040,27648,51200,102400,128000"
+                ;;
+            *)
+                write_safe /sys/module/lowmemorykiller/parameters/minfree "18432,23040,27648,32256,65536,92160"
+                ;;
+        esac
+    fi
+    
+    # Transparent Hugepage
+    if [ -w /sys/kernel/mm/transparent_hugepage/enabled ]; then
+        case "$mode" in
+            aggressive) write_safe /sys/kernel/mm/transparent_hugepage/enabled "always" ;;
+            *) write_safe /sys/kernel/mm/transparent_hugepage/enabled "madvise" ;;
+        esac
+    fi
+}
+
+optimize_io() {
+    local mode="$1"  # performance, balanced, powersave
+    
+    log_msg "Optimizing I/O scheduler: $mode"
+    
+    for disk in /sys/block/*/queue/scheduler; do
+        if [ -w "$disk" ]; then
+            case "$mode" in
+                performance)
+                    if grep -q "noop" "$disk"; then
+                        write_safe "$disk" "noop"
+                    elif grep -q "deadline" "$disk"; then
+                        write_safe "$disk" "deadline"
+                    elif grep -q "kyber" "$disk"; then
+                        write_safe "$disk" "kyber"
+                    fi
+                    ;;
+                powersave)
+                    if grep -q "cfq" "$disk"; then
+                        write_safe "$disk" "cfq"
+                    elif grep -q "bfq" "$disk"; then
+                        write_safe "$disk" "bfq"
+                    fi
+                    ;;
+                *)
+                    if grep -q "bfq" "$disk"; then
+                        write_safe "$disk" "bfq"
+                    elif grep -q "cfq" "$disk"; then
+                        write_safe "$disk" "cfq"
+                    fi
+                    ;;
+            esac
+        fi
+    done
+    
+    # Read-ahead optimization
+    for disk in /sys/block/*/queue/read_ahead_kb; do
+        if [ -w "$disk" ]; then
+            case "$mode" in
+                performance) write_safe "$disk" 2048 ;;
+                powersave) write_safe "$disk" 128 ;;
+                *) write_safe "$disk" 512 ;;
+            esac
+        fi
+    done
+    
+    # Queue depth optimization
+    for disk in /sys/block/*/queue/nr_requests; do
+        if [ -w "$disk" ]; then
+            case "$mode" in
+                performance) write_safe "$disk" 256 ;;
+                powersave) write_safe "$disk" 128 ;;
+                *) write_safe "$disk" 192 ;;
+            esac
+        fi
+    done
+    
+    # I/O affinity
+    for disk in /sys/block/*/queue/rq_affinity; do
+        if [ -w "$disk" ]; then
+            case "$mode" in
+                performance) write_safe "$disk" 2 ;;
+                *) write_safe "$disk" 1 ;;
+            esac
+        fi
+    done
+}
+
+###############################################################################
+# PERFORMANCE PROFILES
+###############################################################################
+
+apply_battery_saver() {
+    log_msg "Applying Battery Saver profile"
+    
+    set_cpu_governor "powersave"
+    set_cpu_freq_range 50 70  # 50-70% of max frequency
+    manage_cpu_boost "off"
+    set_gpu_performance "powersave"
+    optimize_memory "conservative"
+    optimize_io "powersave"
+    
+    # Additional battery optimizations
+    write_safe /sys/module/workqueue/parameters/power_efficient "Y"
+    
+    log_msg "Battery Saver profile applied successfully"
+}
+
+apply_balanced() {
+    log_msg "Applying Balanced profile"
+    
+    set_cpu_governor "schedutil"
+    set_cpu_freq_range 30 85  # 30-85% of max frequency
+    manage_cpu_boost "light"
+    set_gpu_performance "balanced"
+    optimize_memory "balanced"
+    optimize_io "balanced"
+    
+    log_msg "Balanced profile applied successfully"
+}
+
+apply_gaming() {
+    log_msg "Applying Gaming profile"
+    
+    set_cpu_governor "performance"
+    set_cpu_freq_range 60 95  # 60-95% of max frequency
+    manage_cpu_boost "medium"
+    set_gpu_performance "performance"
+    optimize_memory "aggressive"
+    optimize_io "performance"
+    
+    # Disable power-efficient mode
+    write_safe /sys/module/workqueue/parameters/power_efficient "N"
+    
+    # Boost touch responsiveness
+    for boost in /sys/class/input/event*/device/device/f51_latency; do
+        write_safe "$boost" 1
+    done
+    
+    log_msg "Gaming profile applied successfully"
+}
+
+apply_turbo_gaming() {
+    log_msg "Applying Turbo Gaming profile"
+    
+    set_cpu_governor "performance"
+    set_cpu_freq_range 80 100  # 80-100% of max frequency
+    manage_cpu_boost "full"
+    set_gpu_performance "performance"
+    optimize_memory "aggressive"
+    optimize_io "performance"
+    
+    # Maximum performance settings
+    write_safe /sys/module/workqueue/parameters/power_efficient "N"
+    write_safe /proc/sys/kernel/sched_boost 1 2>/dev/null
+    
+    # Touch boost
+    for boost in /sys/class/input/event*/device/device/f51_latency; do
+        write_safe "$boost" 1
+    done
+    
+    log_msg "Turbo Gaming profile applied successfully"
+}
+
+###############################################################################
+# THERMAL MANAGEMENT
+###############################################################################
+
+check_thermal_safety() {
+    local current_temp=$(get_thermal_temp)
+    local temp_celsius=$((current_temp / 1000))
+    
+    if [ "$current_temp" -ge "$THERMAL_EMERGENCY" ]; then
+        log_msg "EMERGENCY: Temperature ${temp_celsius}°C! Forcing Battery Saver mode"
+        apply_battery_saver
+        return 1
+    elif [ "$current_temp" -ge "$THERMAL_THROTTLE" ]; then
+        log_msg "WARNING: Temperature ${temp_celsius}°C! Throttling performance"
+        apply_balanced
+        return 1
+    elif [ "$current_temp" -ge "$THERMAL_WARNING" ]; then
+        log_msg "NOTICE: Temperature ${temp_celsius}°C approaching limits"
+        return 0
+    fi
+    
+    return 0
+}
+
+###############################################################################
+# MAIN FUNCTIONS
+###############################################################################
+
+apply_profile() {
+    local profile="$1"
+    
+    # Check thermal safety first
+    check_thermal_safety
+    
+    case "$profile" in
+        battery_saver|battery-saver|battery)
+            apply_battery_saver
+            echo "battery_saver" > "$STATE_FILE"
+            ;;
+        balanced)
+            apply_balanced
+            echo "balanced" > "$STATE_FILE"
+            ;;
+        gaming)
+            apply_gaming
+            echo "gaming" > "$STATE_FILE"
+            ;;
+        turbo_gaming|turbo-gaming|turbo)
+            apply_turbo_gaming
+            echo "turbo_gaming" > "$STATE_FILE"
+            ;;
+        *)
+            echo "Error: Unknown profile '$profile'"
+            echo "Available profiles: battery_saver, balanced, gaming, turbo_gaming"
+            return 1
+            ;;
+    esac
+    
+    log_msg "Profile '$profile' applied. SoC: $(detect_soc_type), Root: $(detect_root_method)"
+    return 0
+}
+
+show_info() {
+    echo "=== GamerX Performance Manager v2.1 Enhanced ==="
+    echo "SoC Type: $(detect_soc_type)"
+    echo "Root Method: $(detect_root_method)"
+    echo "CPU Count: $(get_cpu_count)"
+    echo "Total RAM: $(get_total_ram) MB"
+    echo "Current Profile: $(cat "$STATE_FILE" 2>/dev/null || echo 'none')"
+    echo "Thermal: $(($(get_thermal_temp) / 1000))°C"
+    echo "Available Governors: $(get_available_governors)"
+    echo "Kernel Features: $(detect_kernel_features)"
+    echo "================================================"
+}
+
+show_current_profile() {
+    cat "$STATE_FILE" 2>/dev/null || echo "balanced"
+}
+
+###############################################################################
+# COMMAND LINE INTERFACE
+###############################################################################
+
+case "$1" in
+    apply)
+        if [ -z "$2" ]; then
+            echo "Usage: gamerx_perf_engine apply <profile>"
+            echo "Profiles: battery_saver, balanced, gaming, turbo_gaming"
+            exit 1
+        fi
+        apply_profile "$2"
+        ;;
+    info)
+        show_info
+        ;;
+    current)
+        show_current_profile
+        ;;
+    thermal)
+        echo "Thermal: $(($(get_thermal_temp) / 1000))°C"
+        ;;
+    *)
+        echo "GamerX Performance Manager v2.1 Enhanced"
+        echo ""
+        echo "Usage: gamerx_perf_engine <command> [options]"
+        echo ""
+        echo "Commands:"
+        echo "  apply <profile>  - Apply performance profile"
+        echo "  info             - Show system information"
+        echo "  current          - Show current profile"
+        echo "  thermal          - Show thermal temperature"
+        echo ""
+        echo "Available Profiles:"
+        echo "  battery_saver    - Maximum battery life"
+        echo "  balanced         - Stock with optimizations"
+        echo "  gaming           - Performance focused"
+        echo "  turbo_gaming     - Maximum performance"
+        exit 1
+        ;;
+esac

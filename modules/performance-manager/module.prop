@@ -1,0 +1,7 @@
+id=gamerx_performance_manager
+name=GamerX Performance Manager
+version=v2.23 Enhanced
+versionCode=223
+author=Mangesh Choudhary
+description=Advanced Performance Manager with Gaming-Focused Profiles | Beautiful UI | Real-time Monitoring | Cross-SoC Support | Thermal Safety
+updateJson=https://raw.githubusercontent.com/GamerX3560/GamerX-Performance-Magisk-Module/main/update.json
